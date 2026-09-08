@@ -1,4 +1,25 @@
+﻿# Environnement virtuel
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
 *.egg-info/
 
+# Modèles Whisper téléchargés en cache (ne pas versionner, trop lourd)
+*.bin
+*.pt
+*.ckpt
 
+# Notes de cours générées (données personnelles, pas du code)
+LectureNotes/
+
+# OS
+.DS_Store
+Thumbs.db
