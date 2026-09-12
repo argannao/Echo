@@ -85,3 +85,8 @@ def list_sessions() -> list[SessionSummary]:
 
 def read_session_content(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def delete_session(path: Path) -> None:
+    """Supprime définitivement le fichier d'une session."""
+    path.unlink(missing_ok=True)

@@ -12,14 +12,14 @@ MacBook Air M2 ce week-end — voir transcriber.py.
 
 from __future__ import annotations
 
-import re
 import threading
+import tkinter as tk
 
 import customtkinter as ctk
 
-from audio_capture import AudioRecorder, TranscriptionWorker, list_input_devices
+from audio_capture import DEFAULT_SENSITIVITY, AudioRecorder, TranscriptionWorker, list_input_devices
 from course_schedule import JOURS, get_current_entry, load_schedule, save_schedule
-from session_manager import Session, list_sessions, read_session_content
+from session_manager import Session, delete_session, list_sessions, read_session_content
 from transcriber import get_default_backend
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,16 @@ ctk.set_appearance_mode("dark")
 
 def mono_font(size=12, weight="normal"):
     return ctk.CTkFont(family=MONO, size=size, weight=weight)
+
+
+def _time_sort_key(creneau: dict) -> int:
+    """Convertit 'HH:MM' en minutes depuis minuit pour un tri chronologique
+    correct (un tri de chaînes classerait '10:00' avant '9:00')."""
+    try:
+        hours, minutes = str(creneau.get("debut", "0:0")).split(":")
+        return int(hours) * 60 + int(minutes)
+    except ValueError:
+        return 0
 
 
 class SectionHeader(ctk.CTkFrame):
@@ -79,25 +89,62 @@ class StatusChip(ctk.CTkFrame):
         self.dot.configure(text_color=color)
 
 
+class AudioLevelBar(ctk.CTkFrame):
+    """Vu-mètre simple : une barre horizontale qui se remplit de gauche à
+    droite selon le niveau audio capté (orange, vire au rouge en fin de
+    course) — utile pour vérifier visuellement que le micro capte un signal."""
+
+    def __init__(self, master, width: int = 140, height: int = 14):
+        super().__init__(
+            master, fg_color=BG_CARD, corner_radius=4, border_width=1, border_color=BORDER,
+        )
+        self.width = width
+        self.height = height
+
+        self.canvas = tk.Canvas(
+            self, width=width, height=height, bg=BG_CARD, highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(padx=1, pady=1)
+
+        self.fill_rect = self.canvas.create_rectangle(0, 0, 0, height, fill=ORANGE, outline="")
+
+    def set_level(self, level: float):
+        """level attendu entre 0.0 et 1.0."""
+        level = max(0.0, min(1.0, level))
+        fill_width = level * self.width
+        color = RED if level >= 0.9 else ORANGE
+        self.canvas.coords(self.fill_rect, 0, 0, fill_width, self.height)
+        self.canvas.itemconfig(self.fill_rect, fill=color)
+
+
 class SessionCard(ctk.CTkFrame):
     """Carte cliquable représentant une session passée dans la sidebar."""
 
-    def __init__(self, master, title: str, date_str: str, on_click):
+    def __init__(self, master, title: str, date_str: str, on_click, on_delete):
         super().__init__(
             master, fg_color=BG_CARD, corner_radius=0, border_width=1, border_color=BORDER,
-            cursor="hand2",
         )
+        top_row = ctk.CTkFrame(self, fg_color="transparent", cursor="hand2")
+        top_row.pack(fill="x", padx=(10, 4), pady=(8, 0))
+
         title_label = ctk.CTkLabel(
-            self, text=title.upper(), font=mono_font(11, "bold"), text_color=TEXT,
-            anchor="w", justify="left", wraplength=190,
+            top_row, text=title.upper(), font=mono_font(11, "bold"), text_color=TEXT,
+            anchor="w", justify="left", wraplength=160, cursor="hand2",
         )
-        title_label.pack(fill="x", padx=10, pady=(8, 0))
+        title_label.pack(side="left", fill="x", expand=True)
+
+        delete_btn = ctk.CTkButton(
+            top_row, text="✕", width=20, height=20, font=mono_font(9, "bold"), corner_radius=0,
+            fg_color=BG_CARD, hover_color=RED, text_color=TEXT_DIM, command=on_delete,
+        )
+        delete_btn.pack(side="right")
+
         date_label = ctk.CTkLabel(
-            self, text=date_str, font=mono_font(10), text_color=TEAL, anchor="w",
+            self, text=date_str, font=mono_font(10), text_color=TEAL, anchor="w", cursor="hand2",
         )
         date_label.pack(fill="x", padx=10, pady=(2, 8))
 
-        for widget in (self, title_label, date_label):
+        for widget in (self, top_row, title_label, date_label):
             widget.bind("<Button-1>", lambda e: on_click())
 
 
@@ -144,6 +191,123 @@ class ScheduleCard(ctk.CTkFrame):
             widget.bind("<Button-1>", lambda e: on_click())
 
 
+class WheelPicker(ctk.CTkFrame):
+    """Sélecteur de valeur façon molette horizontale : glisser à la souris
+    ou utiliser la molette pour changer la valeur — jamais de texte à taper.
+    Inspiré des sélecteurs d'heure façon fuseau horaire."""
+
+    def __init__(self, master, values: list[int], initial_value: int, fmt: str = "{:02d}"):
+        super().__init__(master, fg_color=BG_CARD, corner_radius=6)
+        self.values = values
+        self.index = values.index(initial_value) if initial_value in values else 0
+        self.fmt = fmt
+
+        self.item_width = 32
+        self.visible_half = 2  # affiche index-2 .. index+2 (5 valeurs visibles)
+        self.canvas_width = self.item_width * (self.visible_half * 2 + 1)
+        self.canvas_height = 40
+
+        self._drag_start_x: int | None = None
+        self._drag_accum = 0
+
+        self.canvas = tk.Canvas(
+            self, width=self.canvas_width, height=self.canvas_height, bg=BG_CARD,
+            highlightthickness=0, bd=0, cursor="sb_h_double_arrow",
+        )
+        self.canvas.pack(padx=2, pady=2)
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<MouseWheel>", self._on_wheel_windows)  # Windows/Mac
+        self.canvas.bind("<Button-4>", lambda e: self._step(-1))  # Linux molette haut
+        self.canvas.bind("<Button-5>", lambda e: self._step(1))  # Linux molette bas
+
+        self._redraw()
+
+    def get_value(self) -> int:
+        return self.values[self.index]
+
+    def _step(self, direction: int):
+        new_index = max(0, min(len(self.values) - 1, self.index + direction))
+        if new_index != self.index:
+            self.index = new_index
+            self._redraw()
+
+    def _on_wheel_windows(self, event):
+        self._step(-1 if event.delta > 0 else 1)
+
+    def _on_press(self, event):
+        self._drag_start_x = event.x
+        self._drag_accum = 0
+
+    def _on_drag(self, event):
+        if self._drag_start_x is None:
+            return
+        dx = event.x - self._drag_start_x
+        steps = int(dx / self.item_width)  # un "cran" tous les item_width px glissés
+        if steps != self._drag_accum:
+            self._step(self._drag_accum - steps)  # glisser vers la droite = valeurs plus petites
+            self._drag_accum = steps
+
+    def _on_release(self, event):
+        self._drag_start_x = None
+        self._drag_accum = 0
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        center_x = self.canvas_width / 2
+        center_y = self.canvas_height / 2
+
+        pill_w = self.item_width - 4
+        self.canvas.create_rectangle(
+            center_x - pill_w / 2, 4, center_x + pill_w / 2, self.canvas_height - 4,
+            fill=BG_APP, outline=ORANGE, width=1,
+        )
+
+        for rel in range(-self.visible_half, self.visible_half + 1):
+            idx = self.index + rel
+            if idx < 0 or idx >= len(self.values):
+                continue
+            x = center_x + rel * self.item_width
+            is_center = rel == 0
+            text = self.fmt.format(self.values[idx])
+            color = ORANGE if is_center else TEXT_DIM
+            size = 13 if is_center else 10
+            self.canvas.create_text(
+                x, center_y, text=text, fill=color,
+                font=(MONO, size, "bold" if is_center else "normal"),
+            )
+
+
+class TimeWheelPicker(ctk.CTkFrame):
+    """Combine deux WheelPicker (heures / minutes par pas de 5) pour choisir
+    une heure complète sans jamais taper de texte."""
+
+    HOURS = list(range(24))
+    MINUTES = list(range(0, 60, 5))
+
+    def __init__(self, master, initial: str = "08:00"):
+        super().__init__(master, fg_color="transparent")
+        try:
+            h, m = initial.split(":")
+            init_hour = int(h)
+            init_minute = int(m)
+        except ValueError:
+            init_hour, init_minute = 8, 0
+        if init_minute not in self.MINUTES:
+            init_minute = min(self.MINUTES, key=lambda v: abs(v - init_minute))
+
+        self.hour_picker = WheelPicker(self, self.HOURS, init_hour)
+        self.hour_picker.pack(side="left")
+        ctk.CTkLabel(self, text=":", font=mono_font(14, "bold"), text_color=TEXT).pack(side="left", padx=2)
+        self.minute_picker = WheelPicker(self, self.MINUTES, init_minute)
+        self.minute_picker.pack(side="left")
+
+    def get_value(self) -> str:
+        return f"{self.hour_picker.get_value():02d}:{self.minute_picker.get_value():02d}"
+
+
 class EchoApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -161,7 +325,9 @@ class EchoApp(ctk.CTk):
         self._elapsed_seconds = 0
         self._blink_on = True
         self._viewing_past_session = False
+        self._viewed_session_path = None
         self._auto_filled_title = ""
+        self.current_sensitivity = DEFAULT_SENSITIVITY
 
         self.schedule_view_visible = False
         self.schedule_data: dict = {}
@@ -193,6 +359,9 @@ class EchoApp(ctk.CTk):
             title_block, text="// SYSTEME DE TRANSCRIPTION", font=mono_font(10),
             text_color=TEAL_DIM,
         ).pack(anchor="w")
+
+        self.level_bar = AudioLevelBar(top_bar, width=140, height=14)
+        self.level_bar.pack(side="right", padx=(0, 16))
 
         self.engine_chip = StatusChip(top_bar, "MOTEUR: INITIALISATION", ORANGE_DIM)
         self.engine_chip.pack(side="right", padx=16)
@@ -299,6 +468,38 @@ class EchoApp(ctk.CTk):
             rec_row, text="00:00:00", font=mono_font(11, "bold"), text_color=TEAL,
         )
         self.timer_label.pack(side="right")
+
+        # curseur de sensibilité (multiplicateur au-dessus du bruit ambiant,
+        # auto-calibré en continu — pas besoin de deviner une valeur absolue)
+        sensitivity_row = ctk.CTkFrame(control_card, fg_color="transparent")
+        sensitivity_row.pack(fill="x", padx=14, pady=(0, 12))
+        ctk.CTkLabel(
+            sensitivity_row, text="SENSIBILITE", font=mono_font(10, "bold"),
+            text_color=TEXT_DIM, width=70, anchor="w",
+        ).pack(side="left")
+        self.sensitivity_slider = ctk.CTkSlider(
+            sensitivity_row, from_=1.5, to=8.0, number_of_steps=130,
+            fg_color=BG_CARD, progress_color=ORANGE, button_color=ORANGE,
+            button_hover_color="#e0562a", command=self._on_sensitivity_change,
+        )
+        self.sensitivity_slider.set(DEFAULT_SENSITIVITY)
+        self.sensitivity_slider.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.sensitivity_value_label = ctk.CTkLabel(
+            sensitivity_row, text=f"x{DEFAULT_SENSITIVITY:.1f}", font=mono_font(10),
+            text_color=TEAL, width=50,
+        )
+        self.sensitivity_value_label.pack(side="left")
+
+        # interrupteur de réduction de bruit ambiant (façon Krisp)
+        denoise_row = ctk.CTkFrame(control_card, fg_color="transparent")
+        denoise_row.pack(fill="x", padx=14, pady=(0, 12))
+        self.denoise_switch = ctk.CTkSwitch(
+            denoise_row, text="REDUCTION DE BRUIT", font=mono_font(10, "bold"),
+            text_color=TEXT_DIM, progress_color=ORANGE, button_color=TEXT,
+            button_hover_color=TEXT, fg_color=BG_CARD, command=self._on_denoise_toggle,
+        )
+        self.denoise_switch.select()  # activé par défaut
+        self.denoise_switch.pack(side="left")
 
         # panneau transcription
         transcript_card = ctk.CTkFrame(self.session_view, fg_color=BG_PANEL, corner_radius=0, border_width=1, border_color=BORDER)
@@ -411,7 +612,7 @@ class EchoApp(ctk.CTk):
             for widget in frame.winfo_children():
                 widget.destroy()
 
-            creneaux = self.schedule_data.get(jour) or []
+            creneaux = sorted(self.schedule_data.get(jour) or [], key=_time_sort_key)
             if not creneaux:
                 ctk.CTkLabel(
                     frame, text="Aucun créneau", font=mono_font(9), text_color=TEXT_DIM,
@@ -428,7 +629,7 @@ class EchoApp(ctk.CTk):
     def _open_creneau_form(self, jour: str, creneau: dict | None, idx: int | None):
         form = ctk.CTkToplevel(self)
         form.title(f"Créneau — {jour.capitalize()}")
-        form.geometry("340x300")
+        form.geometry("500x380")
         form.configure(fg_color=BG_APP)
         form.transient(self)
 
@@ -449,8 +650,19 @@ class EchoApp(ctk.CTk):
             entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
             fields[key] = entry
 
-        add_field("DEBUT", "debut", creneau.get("debut", "") if creneau else "")
-        add_field("FIN", "fin", creneau.get("fin", "") if creneau else "")
+        def add_time_wheel(label: str, default: str):
+            row = ctk.CTkFrame(form, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=6)
+            ctk.CTkLabel(
+                row, text=label, font=mono_font(10, "bold"), text_color=TEXT_DIM,
+                width=60, anchor="w",
+            ).pack(side="left")
+            wheel = TimeWheelPicker(row, initial=default or "08:00")
+            wheel.pack(side="left", padx=(8, 0))
+            return wheel
+
+        debut_wheel = add_time_wheel("DEBUT", creneau.get("debut", "") if creneau else "08:00")
+        fin_wheel = add_time_wheel("FIN", creneau.get("fin", "") if creneau else "10:00")
         add_field("TITRE", "titre", creneau.get("titre", "") if creneau else "")
         add_field("INFOS", "info", creneau.get("info", "") if creneau else "")
         ctk.CTkLabel(
@@ -462,14 +674,13 @@ class EchoApp(ctk.CTk):
         error_label.pack(pady=(8, 0))
 
         def on_save():
-            debut = fields["debut"].get().strip()
-            fin = fields["fin"].get().strip()
+            debut = debut_wheel.get_value()
+            fin = fin_wheel.get_value()
             titre = fields["titre"].get().strip()
             info = fields["info"].get().strip()
 
-            time_pattern = r"^\d{1,2}:\d{2}$"
-            if not re.match(time_pattern, debut) or not re.match(time_pattern, fin):
-                error_label.configure(text="Format horaire invalide (attendu HH:MM)")
+            if fin <= debut:
+                error_label.configure(text="L'heure de fin doit être après le début")
                 return
 
             new_entry = {"debut": debut, "fin": fin, "titre": titre or "Cours sans titre"}
@@ -481,7 +692,7 @@ class EchoApp(ctk.CTk):
                 creneaux.append(new_entry)
             else:
                 creneaux[idx] = new_entry
-            creneaux.sort(key=lambda c: c.get("debut", ""))
+            creneaux.sort(key=_time_sort_key)
 
             form.destroy()
             self._save_schedule_and_refresh()
@@ -560,6 +771,7 @@ class EchoApp(ctk.CTk):
             card = SessionCard(
                 self.session_list_frame, summary.title, summary.date_str,
                 on_click=lambda s=summary: self._view_past_session(s),
+                on_delete=lambda s=summary: self._confirm_delete_session(s),
             )
             card.pack(fill="x", pady=(0, 6))
 
@@ -567,6 +779,7 @@ class EchoApp(ctk.CTk):
         if self._recording:
             return  # on ne quitte pas une session en cours d'enregistrement
         self._viewing_past_session = True
+        self._viewed_session_path = summary.path
         self.transcript_header_label.configure(text=f"// {summary.title.upper()}")
         content = read_session_content(summary.path)
         self.transcript_box.configure(state="normal")
@@ -577,9 +790,50 @@ class EchoApp(ctk.CTk):
 
     def _return_to_live(self):
         self._viewing_past_session = False
+        self._viewed_session_path = None
         self.back_to_live_button.pack_forget()
         self.transcript_header_label.configure(text="// JOURNAL EN DIRECT")
         self._clear_transcript()
+
+    def _confirm_delete_session(self, summary):
+        if self._recording:
+            return
+
+        confirm = ctk.CTkToplevel(self)
+        confirm.title("Confirmer la suppression")
+        confirm.geometry("340x170")
+        confirm.configure(fg_color=BG_APP)
+        confirm.transient(self)
+
+        ctk.CTkLabel(
+            confirm, text=f"Supprimer définitivement\n« {summary.title} » ?",
+            font=mono_font(11, "bold"), text_color=TEXT, justify="center",
+        ).pack(pady=(24, 6))
+        ctk.CTkLabel(
+            confirm, text="Cette action est irréversible.", font=mono_font(9),
+            text_color=TEXT_DIM,
+        ).pack(pady=(0, 16))
+
+        btn_row = ctk.CTkFrame(confirm, fg_color="transparent")
+        btn_row.pack()
+
+        def do_delete():
+            delete_session(summary.path)
+            confirm.destroy()
+            if self._viewed_session_path == summary.path:
+                self._return_to_live()
+            self._refresh_session_list()
+
+        ctk.CTkButton(
+            btn_row, text="SUPPRIMER", font=mono_font(10, "bold"), corner_radius=0,
+            fg_color=BG_CARD, hover_color=RED, text_color=RED, border_width=1,
+            border_color=RED, command=do_delete,
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            btn_row, text="ANNULER", font=mono_font(10, "bold"), corner_radius=0,
+            fg_color=BG_CARD, hover_color=BORDER, text_color=TEXT,
+            command=confirm.destroy,
+        ).pack(side="left", padx=6)
 
     # ------------------------------------------------------------------
     # Logique session / enregistrement
@@ -595,11 +849,27 @@ class EchoApp(ctk.CTk):
             None,
         )
 
-        self.worker = TranscriptionWorker(self.backend, on_text_ready=self._on_text_ready)
+        self.worker = TranscriptionWorker(
+            self.backend, on_text_ready=self._on_text_ready,
+            denoise_enabled=bool(self.denoise_switch.get()),
+        )
         self.worker.start()
 
-        self.recorder = AudioRecorder(device_index, on_segment_ready=self.worker.submit)
-        self.recorder.start()
+        self.recorder = AudioRecorder(
+            device_index, on_segment_ready=self.worker.submit, on_level=self._on_audio_level,
+            sensitivity=self.current_sensitivity,
+        )
+        try:
+            self.recorder.start()
+        except Exception as exc:
+            self.rec_status_label.configure(text=f"ERREUR MICRO: {exc}", text_color=RED)
+            self.worker.stop()
+            self.recorder = None
+            self.worker = None
+            self.start_button.configure(state="normal")
+            self.title_entry.configure(state="normal")
+            self.device_menu.configure(state="normal")
+            return
 
         self._recording = True
         self._elapsed_seconds = 0
@@ -632,7 +902,25 @@ class EchoApp(ctk.CTk):
         self.device_menu.configure(state="normal")
         self.rec_status_label.configure(text="EN ATTENTE", text_color=TEXT_DIM)
         self.rec_dot.configure(text_color=TEXT_DIM)
+        self.level_bar.set_level(0.0)
         self._refresh_session_list()
+
+    def _on_audio_level(self, rms: float):
+        # normalisation approximative : une voix parlée normale tourne autour
+        # de 0.05-0.15 de RMS sur un signal float32 — à ajuster si besoin.
+        level = rms / 0.15
+        self.after(0, lambda: self.level_bar.set_level(level))
+
+    def _on_sensitivity_change(self, value: float):
+        self.current_sensitivity = value
+        self.sensitivity_value_label.configure(text=f"x{value:.1f}")
+        if self.recorder is not None:
+            self.recorder.set_sensitivity(value)
+
+    def _on_denoise_toggle(self):
+        enabled = bool(self.denoise_switch.get())
+        if self.worker is not None:
+            self.worker.set_denoise_enabled(enabled)
 
     def _on_text_ready(self, text: str, started_at: float):
         self.after(0, lambda: self._append_transcript(text, started_at))

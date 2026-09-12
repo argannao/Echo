@@ -16,9 +16,13 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+from noise_reduction import denoise
+
 SAMPLE_RATE = 16000  # attendu par Whisper
 BLOCK_DURATION = 0.5  # secondes par bloc lu depuis le micro
-SILENCE_RMS_THRESHOLD = 0.01  # à ajuster selon le micro / la salle
+DEFAULT_SENSITIVITY = 3.5  # multiplicateur au-dessus du bruit ambiant mesuré automatiquement
+MIN_NOISE_FLOOR = 0.0008  # plancher pour éviter un seuil dégénéré si l'environnement est ultra silencieux
+NOISE_FLOOR_ADAPT_RATE = 0.05  # vitesse d'adaptation de l'estimation du bruit ambiant (EMA)
 SILENCE_DURATION_TO_CUT = 1.2  # secondes de silence avant de couper un segment
 MAX_SEGMENT_DURATION = 25.0  # sécurité : on coupe même sans silence au-delà
 
@@ -45,11 +49,23 @@ class AudioRecorder:
     Enregistre en continu depuis un micro donné et pousse des AudioSegment
     complets (phrase/segment de parole coupé sur silence) dans une queue,
     consommée ensuite par le thread de transcription.
+
+    La détection de silence s'auto-calibre : le "bruit ambiant" est estimé
+    en continu (moyenne glissante des blocs considérés silencieux), et le
+    seuil de déclenchement est ce bruit ambiant multiplié par un facteur de
+    sensibilité réglable (curseur dans l'UI) — pas besoin de deviner une
+    valeur absolue à la main.
     """
 
-    def __init__(self, device_index: int | None, on_segment_ready):
+    def __init__(
+        self, device_index: int | None, on_segment_ready, on_level=None,
+        sensitivity: float = DEFAULT_SENSITIVITY,
+    ):
         self.device_index = device_index
         self.on_segment_ready = on_segment_ready  # callback(AudioSegment)
+        self.on_level = on_level  # callback(rms: float), appelé à chaque bloc, pour un vu-mètre
+        self.sensitivity = sensitivity
+        self.noise_floor = MIN_NOISE_FLOOR
         self._stream: sd.InputStream | None = None
         self._running = False
 
@@ -57,19 +73,34 @@ class AudioRecorder:
         self._segment_started_at: float | None = None
         self._silence_accum = 0.0
 
+    def set_sensitivity(self, value: float):
+        """Permet d'ajuster la sensibilité en direct (curseur dans l'UI),
+        y compris pendant un enregistrement en cours."""
+        self.sensitivity = value
+
+    @property
+    def current_threshold(self) -> float:
+        """Seuil effectif actuel (bruit ambiant mesuré × sensibilité)."""
+        return self.noise_floor * self.sensitivity
+
     def start(self):
         if self._running:
             return
         self._running = True
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            device=self.device_index,
-            blocksize=int(SAMPLE_RATE * BLOCK_DURATION),
-            callback=self._on_audio_block,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=self.device_index,
+                blocksize=int(SAMPLE_RATE * BLOCK_DURATION),
+                callback=self._on_audio_block,
+            )
+            self._stream.start()
+        except Exception:
+            self._running = False
+            self._stream = None
+            raise
 
     def stop(self):
         self._running = False
@@ -87,14 +118,23 @@ class AudioRecorder:
         block = indata[:, 0].copy()
         rms = float(np.sqrt(np.mean(block**2)))
 
-        if rms >= SILENCE_RMS_THRESHOLD:
+        if self.on_level:
+            self.on_level(rms)
+
+        threshold = self.current_threshold
+
+        if rms >= threshold:
             # bloc "parlé"
             if self._segment_started_at is None:
                 self._segment_started_at = time.time()
             self._buffer.append(block)
             self._silence_accum = 0.0
         else:
-            # bloc silencieux
+            # bloc silencieux : sert aussi à ré-estimer le bruit ambiant
+            self.noise_floor = max(
+                MIN_NOISE_FLOOR,
+                self.noise_floor * (1 - NOISE_FLOOR_ADAPT_RATE) + rms * NOISE_FLOOR_ADAPT_RATE,
+            )
             if self._segment_started_at is not None:
                 self._buffer.append(block)  # garde un peu de silence de fin (naturel)
                 self._silence_accum += BLOCK_DURATION
@@ -136,12 +176,17 @@ class TranscriptionWorker:
     (qui doit rester très rapide) ni l'UI.
     """
 
-    def __init__(self, backend, on_text_ready):
+    def __init__(self, backend, on_text_ready, denoise_enabled: bool = True):
         self.backend = backend
         self.on_text_ready = on_text_ready  # callback(text: str, started_at: float)
+        self.denoise_enabled = denoise_enabled
         self._queue: queue.Queue[AudioSegment] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._running = False
+
+    def set_denoise_enabled(self, enabled: bool):
+        """Permet d'activer/désactiver le débruitage en direct depuis l'UI."""
+        self.denoise_enabled = enabled
 
     def submit(self, segment: AudioSegment):
         self._queue.put(segment)
@@ -161,7 +206,8 @@ class TranscriptionWorker:
             except queue.Empty:
                 continue
             try:
-                text = self.backend.transcribe(segment.audio, segment.sample_rate)
+                audio = denoise(segment.audio, segment.sample_rate) if self.denoise_enabled else segment.audio
+                text = self.backend.transcribe(audio, segment.sample_rate)
             except Exception as exc:  # on ne veut jamais planter le worker
                 print(f"[transcription] erreur: {exc}")
                 text = ""

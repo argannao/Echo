@@ -34,10 +34,25 @@ class FasterWhisperBackend(TranscriptionBackend):
     logique de capture/segmentation/UI sous Windows.
     """
 
-    def __init__(self, model_size: str = "small", device: str = "cpu", compute_type: str = "int8"):
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        cpu_threads: int = 0,
+    ):
         from faster_whisper import WhisperModel
+        import os
 
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        # cpu_threads=0 laisse CTranslate2 choisir, mais sur des machines avec
+        # peu de coeurs il est parfois plus rapide de forcer explicitement le
+        # nombre de threads logiques disponibles.
+        if cpu_threads == 0:
+            cpu_threads = os.cpu_count() or 4
+
+        self.model = WhisperModel(
+            model_size, device=device, compute_type=compute_type, cpu_threads=cpu_threads,
+        )
 
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
         if sample_rate != 16000:
@@ -47,7 +62,10 @@ class FasterWhisperBackend(TranscriptionBackend):
             audio,
             language="fr",
             vad_filter=True,  # filtre silence interne en plus de notre propre VAD
-            beam_size=5,
+            beam_size=1,  # decoding "greedy" : nettement plus rapide que beam_size=5,
+                           # léger compromis sur la précision
+            condition_on_previous_text=False,  # chaque segment traité indépendamment,
+                                                # évite un effet de dérive et coûte moins cher
         )
         return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -80,4 +98,4 @@ class WhisperCppBackend(TranscriptionBackend):
 
 def get_default_backend() -> TranscriptionBackend:
     """Backend utilisé par défaut pendant la phase de dev sous Windows."""
-    return FasterWhisperBackend(model_size="small", device="cpu", compute_type="int8")
+    return FasterWhisperBackend(model_size="base", device="cpu", compute_type="int8")
