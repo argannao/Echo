@@ -52,3 +52,36 @@ class Session:
             duration = ended_at - self.started_at
             minutes = int(duration.total_seconds() // 60)
             f.write(f"\n---\n_Session terminée — durée : {minutes} min_\n")
+
+
+class SessionSummary:
+    """Métadonnées légères d'une session passée, pour affichage en liste."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.title = path.stem
+        self.date_str = ""
+        self._load_header()
+
+    def _load_header(self):
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip()
+        except OSError:
+            return
+        if first_line.startswith("# "):
+            self.title = first_line[2:].strip()
+        if second_line.startswith("_") and second_line.endswith("_"):
+            self.date_str = second_line.strip("_")
+
+
+def list_sessions() -> list[SessionSummary]:
+    """Liste les sessions passées, triées de la plus récente à la plus ancienne."""
+    ensure_notes_dir()
+    files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [SessionSummary(p) for p in files]
+
+
+def read_session_content(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
