@@ -17,8 +17,11 @@ import tkinter as tk
 
 import customtkinter as ctk
 
+import ai_setup
 from audio_capture import DEFAULT_SENSITIVITY, AudioRecorder, TranscriptionWorker, list_input_devices
 from course_schedule import JOURS, get_current_entry, load_schedule, save_schedule
+from notes_generator import build_pdf_from_markdown, generate_notes_document, open_containing_folder
+from translation import LANGUAGE_CODES
 from session_manager import Session, delete_session, list_sessions, read_session_content
 from transcriber import get_default_backend
 
@@ -326,6 +329,7 @@ class EchoApp(ctk.CTk):
         self._blink_on = True
         self._viewing_past_session = False
         self._viewed_session_path = None
+        self._last_finished_session_path = None
         self._auto_filled_title = ""
         self.current_sensitivity = DEFAULT_SENSITIVITY
 
@@ -339,6 +343,7 @@ class EchoApp(ctk.CTk):
         self._refresh_session_list()
         self._apply_current_course()
         self._schedule_check_loop()
+        self._check_ai_setup_async()
 
     # ------------------------------------------------------------------
     # Construction de l'UI
@@ -366,6 +371,12 @@ class EchoApp(ctk.CTk):
         self.engine_chip = StatusChip(top_bar, "MOTEUR: INITIALISATION", ORANGE_DIM)
         self.engine_chip.pack(side="right", padx=16)
 
+        self.ai_status_chip = StatusChip(top_bar, "IA: VERIFICATION...", ORANGE_DIM)
+        self.ai_status_chip.pack(side="right", padx=(0, 8))
+        for widget in (self.ai_status_chip, self.ai_status_chip.dot, self.ai_status_chip.label):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda e: self._open_ai_setup_dialog())
+
         # --- corps : sidebar + zone principale ---
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
@@ -390,6 +401,48 @@ class EchoApp(ctk.CTk):
             sidebar, text="< RETOUR AU DIRECT", font=mono_font(10, "bold"),
             fg_color=BG_CARD, hover_color=BORDER, text_color=TEAL, corner_radius=0,
             border_width=1, border_color=TEAL_DIM, command=self._return_to_live,
+        )
+        # affiché seulement quand on consulte une session passée
+
+        self.translate_language_menu = ctk.CTkOptionMenu(
+            sidebar, values=list(LANGUAGE_CODES.keys()), font=mono_font(9, "bold"),
+            fg_color=BG_CARD, button_color=BORDER, button_hover_color=ORANGE_DIM,
+            corner_radius=0, text_color=TEXT_DIM, dropdown_fg_color=BG_CARD,
+        )
+        self.translate_language_menu.set("Birman")
+        # affiché seulement quand on consulte une session passée
+
+        self.generate_pdf_fr_button = ctk.CTkButton(
+            sidebar, text="GENERER PDF (FR)", font=mono_font(10, "bold"),
+            fg_color=BG_CARD, hover_color=BORDER, text_color=TEAL, corner_radius=0,
+            border_width=1, border_color=TEAL_DIM,
+            command=lambda: self._on_generate_pdf(None),
+        )
+        # affiché seulement quand on consulte une session passée
+
+        self.generate_pdf_translated_button = ctk.CTkButton(
+            sidebar, text="GENERER PDF + TRADUCTION", font=mono_font(10, "bold"),
+            fg_color=BG_CARD, hover_color=BORDER, text_color=TEAL, corner_radius=0,
+            border_width=1, border_color=TEAL_DIM,
+            command=lambda: self._on_generate_pdf(self.translate_language_menu.get()),
+        )
+        # affiché seulement quand on consulte une session passée
+
+        self.open_folder_button = ctk.CTkButton(
+            sidebar, text="OUVRIR LE DOSSIER", font=mono_font(10, "bold"),
+            fg_color=BG_CARD, hover_color=BORDER, text_color=TEXT, corner_radius=0,
+            border_width=1, border_color=BORDER,
+            command=lambda: self._viewed_session_path and open_containing_folder(
+                self._viewed_session_path.with_suffix(".pdf")
+                if self._viewed_session_path.with_suffix(".pdf").exists()
+                else self._viewed_session_path
+            ),
+        )
+        # affiché seulement quand on consulte une session passée
+
+        self.pdf_status_label = ctk.CTkLabel(
+            sidebar, text="", font=mono_font(9), text_color=TEXT_DIM,
+            anchor="w", justify="left", wraplength=200,
         )
         # affiché seulement quand on consulte une session passée
 
@@ -501,6 +554,57 @@ class EchoApp(ctk.CTk):
         self.denoise_switch.select()  # activé par défaut
         self.denoise_switch.pack(side="left")
 
+        # génération automatique de notes PDF (IA locale, via Ollama) après l'arrêt
+        auto_pdf_row = ctk.CTkFrame(control_card, fg_color="transparent")
+        auto_pdf_row.pack(fill="x", padx=14, pady=(0, 4))
+        self.auto_pdf_switch = ctk.CTkSwitch(
+            auto_pdf_row, text="PDF AUTO APRES ARRET (IA)", font=mono_font(10, "bold"),
+            text_color=TEXT_DIM, progress_color=ORANGE, button_color=TEXT,
+            button_hover_color=TEXT, fg_color=BG_CARD,
+        )
+        self.auto_pdf_switch.pack(side="left")
+
+        self.auto_translate_language_menu = ctk.CTkOptionMenu(
+            auto_pdf_row, values=["Aucune"] + list(LANGUAGE_CODES.keys()), font=mono_font(9, "bold"),
+            fg_color=BG_CARD, button_color=BORDER, button_hover_color=ORANGE_DIM,
+            corner_radius=0, text_color=TEXT_DIM, dropdown_fg_color=BG_CARD, width=110,
+        )
+        self.auto_translate_language_menu.set("Aucune")
+        self.auto_translate_language_menu.pack(side="left", padx=(16, 0))
+
+        self.auto_pdf_status_label = ctk.CTkLabel(
+            control_card, text="", font=mono_font(9), text_color=TEXT_DIM, anchor="w",
+        )
+        self.auto_pdf_status_label.pack(fill="x", padx=14, pady=(0, 12))
+
+        self.post_session_pdf_fr_button = ctk.CTkButton(
+            control_card, text="GENERER PDF (FR)", font=mono_font(10, "bold"),
+            corner_radius=0, fg_color=BG_CARD, hover_color=BORDER, text_color=TEAL,
+            border_width=1, border_color=TEAL_DIM,
+            command=lambda: self._on_generate_pdf_for_last_session(None),
+        )
+        # affiché seulement juste après l'arrêt d'un enregistrement (si génération auto désactivée)
+
+        self.post_session_pdf_translated_button = ctk.CTkButton(
+            control_card, text="GENERER PDF + TRADUCTION", font=mono_font(10, "bold"),
+            corner_radius=0, fg_color=BG_CARD, hover_color=BORDER, text_color=TEAL,
+            border_width=1, border_color=TEAL_DIM,
+            command=lambda: self._on_generate_pdf_for_last_session(self.auto_translate_language_menu.get()),
+        )
+        # affiché seulement juste après l'arrêt d'un enregistrement (si génération auto désactivée)
+
+        self.open_folder_button_session = ctk.CTkButton(
+            control_card, text="OUVRIR LE DOSSIER", font=mono_font(10, "bold"),
+            corner_radius=0, fg_color=BG_CARD, hover_color=BORDER, text_color=TEXT,
+            border_width=1, border_color=BORDER,
+            command=lambda: self._last_finished_session_path and open_containing_folder(
+                self._last_finished_session_path.with_suffix(".pdf")
+                if self._last_finished_session_path.with_suffix(".pdf").exists()
+                else self._last_finished_session_path
+            ),
+        )
+        # affiché seulement juste après l'arrêt d'un enregistrement
+
         # panneau transcription
         transcript_card = ctk.CTkFrame(self.session_view, fg_color=BG_PANEL, corner_radius=0, border_width=1, border_color=BORDER)
         transcript_card.pack(fill="both", expand=True, padx=16, pady=(8, 16))
@@ -588,6 +692,81 @@ class EchoApp(ctk.CTk):
     def _on_backend_ready(self):
         self.engine_chip.set("MOTEUR: PRET", TEAL)
         self.start_button.configure(state="normal")
+
+    # ------------------------------------------------------------------
+    # IA locale (Ollama) — détection auto + téléchargement du modèle
+    # ------------------------------------------------------------------
+
+    def _check_ai_setup_async(self):
+        def _check():
+            status = ai_setup.check_status()
+            self.after(0, lambda: self._on_ai_status_checked(status))
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_ai_status_checked(self, status: str):
+        if status == "ready":
+            self.ai_status_chip.set("IA: PRET", TEAL)
+        elif status == "missing_model":
+            self._auto_download_model()
+        else:
+            self.ai_status_chip.set("IA: PAQUET MANQUANT", RED)
+
+    def _auto_download_model(self):
+        """Le paquet llama-cpp-python est installé mais le fichier modèle
+        n'est pas encore téléchargé : on le télécharge automatiquement en
+        arrière-plan, aucune action manuelle nécessaire."""
+        self.ai_status_chip.set("IA: TELECHARGEMENT MODELE...", ORANGE)
+
+        def _download():
+            def _progress(text):
+                self.after(0, lambda: self.ai_status_chip.set(f"IA: {text[:28].upper()}", ORANGE))
+
+            try:
+                ai_setup.download_model(on_progress=_progress)
+            except Exception:
+                self.after(0, lambda: self.ai_status_chip.set("IA: ECHEC TELECHARGEMENT", RED))
+                return
+            self.after(0, lambda: self.ai_status_chip.set("IA: PRET", TEAL))
+
+        threading.Thread(target=_download, daemon=True).start()
+
+    def _open_ai_setup_dialog(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("IA locale — configuration")
+        dialog.geometry("380x260")
+        dialog.configure(fg_color=BG_APP)
+        dialog.transient(self)
+
+        SectionHeader(dialog, "IA locale (llama-cpp-python)", TEAL).pack(fill="x", padx=16, pady=(16, 10))
+
+        status_label = ctk.CTkLabel(
+            dialog, text="Vérification...", font=mono_font(11, "bold"), text_color=TEXT,
+            wraplength=340, justify="center",
+        )
+        status_label.pack(pady=(0, 16))
+
+        def refresh():
+            status = ai_setup.check_status()
+            self._on_ai_status_checked(status)
+            texts = {
+                "ready": "Tout est prêt.",
+                "missing_model": "Téléchargement du modèle en cours...",
+                "missing_package": "Paquet manquant : lance 'uv add llama-cpp-python'\ndans le terminal, puis relance la vérification.",
+            }
+            status_label.configure(text=texts.get(status, status))
+
+        ctk.CTkButton(
+            dialog, text="REVERIFIER", font=mono_font(10, "bold"), corner_radius=0,
+            fg_color=ORANGE, hover_color="#e0562a", text_color=BG_APP, command=refresh,
+        ).pack(fill="x", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(
+            dialog, text="Une fois le paquet installé, le modèle (~2 Go) se\ntélécharge automatiquement tout seul.",
+            font=mono_font(9), text_color=TEXT_DIM, justify="center",
+        ).pack(pady=(8, 0))
+
+        refresh()
 
     # ------------------------------------------------------------------
     # Emploi du temps (vue intégrée, remplace la zone principale)
@@ -786,14 +965,89 @@ class EchoApp(ctk.CTk):
         self.transcript_box.delete("1.0", "end")
         self.transcript_box.insert("1.0", content)
         self.transcript_box.configure(state="disabled")
+
+        self.pdf_status_label.configure(text="")
+        self.pdf_status_label.pack(fill="x", padx=10, pady=(0, 4), side="bottom")
+        self.open_folder_button.pack(fill="x", padx=10, pady=(0, 4), side="bottom")
+        self.generate_pdf_translated_button.pack(fill="x", padx=10, pady=(0, 4), side="bottom")
+        self.translate_language_menu.pack(fill="x", padx=10, pady=(0, 6), side="bottom")
+        self.generate_pdf_fr_button.pack(fill="x", padx=10, pady=(0, 4), side="bottom")
         self.back_to_live_button.pack(fill="x", padx=10, pady=(0, 10), side="bottom")
 
     def _return_to_live(self):
         self._viewing_past_session = False
         self._viewed_session_path = None
         self.back_to_live_button.pack_forget()
+        self.generate_pdf_fr_button.pack_forget()
+        self.generate_pdf_translated_button.pack_forget()
+        self.open_folder_button.pack_forget()
+        self.translate_language_menu.pack_forget()
+        self.pdf_status_label.pack_forget()
         self.transcript_header_label.configure(text="// JOURNAL EN DIRECT")
         self._clear_transcript()
+
+    def _generate_pdf_async(self, session_path, target_language, on_status, on_finished=None):
+        """Lance la génération de notes + PDF en arrière-plan pour une
+        session donnée. target_language est un nom de langue (ex: "Birman")
+        ou None pour ne pas traduire. on_status(text, color) est appelé
+        pour mettre à jour un label de statut ; on_finished() est appelé à
+        la fin (succès ou échec), pour par ex. réactiver un bouton."""
+
+        def _worker():
+            try:
+                raw_text = read_session_content(session_path)
+                structured_md = generate_notes_document(raw_text, target_language=target_language)
+                pdf_path = session_path.with_suffix(".pdf")
+                build_pdf_from_markdown(structured_md, pdf_path)
+            except Exception as exc:
+                self.after(0, lambda: on_status(f"Erreur : {exc}", RED))
+                if on_finished:
+                    self.after(0, on_finished)
+                return
+            self.after(0, lambda: on_status(f"✓ PDF généré : {pdf_path.name}", TEAL))
+            if on_finished:
+                self.after(0, on_finished)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_generate_pdf(self, target_language: str | None):
+        if self._viewed_session_path is None:
+            return
+
+        session_path = self._viewed_session_path
+        buttons = (self.generate_pdf_fr_button, self.generate_pdf_translated_button)
+        for btn in buttons:
+            btn.configure(state="disabled")
+        self.pdf_status_label.configure(text="Appel du modèle local en cours...", text_color=TEAL)
+
+        def _done():
+            self.generate_pdf_fr_button.configure(state="normal")
+            self.generate_pdf_translated_button.configure(state="normal")
+
+        self._generate_pdf_async(
+            session_path, target_language,
+            on_status=lambda t, c: self.pdf_status_label.configure(text=t, text_color=c),
+            on_finished=_done,
+        )
+
+    def _on_generate_pdf_for_last_session(self, target_language: str | None):
+        if self._last_finished_session_path is None:
+            return
+
+        session_path = self._last_finished_session_path
+        self.post_session_pdf_fr_button.configure(state="disabled")
+        self.post_session_pdf_translated_button.configure(state="disabled")
+        self.auto_pdf_status_label.configure(text="Génération PDF en cours (IA locale)...", text_color=TEAL)
+
+        def _done():
+            self.post_session_pdf_fr_button.configure(state="normal")
+            self.post_session_pdf_translated_button.configure(state="normal")
+
+        self._generate_pdf_async(
+            session_path, target_language,
+            on_status=lambda t, c: self.auto_pdf_status_label.configure(text=t, text_color=c),
+            on_finished=_done,
+        )
 
     def _confirm_delete_session(self, summary):
         if self._recording:
@@ -875,6 +1129,10 @@ class EchoApp(ctk.CTk):
         self._elapsed_seconds = 0
         self._viewing_past_session = False
         self.back_to_live_button.pack_forget()
+        self.post_session_pdf_fr_button.pack_forget()
+        self.post_session_pdf_translated_button.pack_forget()
+        self.open_folder_button_session.pack_forget()
+        self.auto_pdf_status_label.configure(text="")
 
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -892,6 +1150,8 @@ class EchoApp(ctk.CTk):
             self.recorder.stop()
         if self.worker:
             self.worker.stop()
+
+        session_path = self.session.path if self.session else None
         if self.session:
             self.session.close()
 
@@ -904,6 +1164,32 @@ class EchoApp(ctk.CTk):
         self.rec_dot.configure(text_color=TEXT_DIM)
         self.level_bar.set_level(0.0)
         self._refresh_session_list()
+
+        self._last_finished_session_path = session_path
+        self.post_session_pdf_fr_button.pack_forget()
+        self.post_session_pdf_translated_button.pack_forget()
+        self.open_folder_button_session.pack_forget()
+
+        if session_path is not None:
+            self.open_folder_button_session.pack(fill="x", padx=14, pady=(0, 4))
+
+        if session_path is not None and bool(self.auto_pdf_switch.get()):
+            target_language = self.auto_translate_language_menu.get()
+            self.auto_pdf_status_label.configure(
+                text="Génération PDF en cours (IA locale)...", text_color=TEAL,
+            )
+            self._generate_pdf_async(
+                session_path, target_language,
+                on_status=lambda t, c: self.auto_pdf_status_label.configure(text=t, text_color=c),
+            )
+        elif session_path is not None:
+            # génération auto désactivée : boutons pour lancer la génération
+            # au cas par cas, pour cette session qui vient de se terminer
+            self.auto_pdf_status_label.configure(text="")
+            self.post_session_pdf_fr_button.configure(state="normal")
+            self.post_session_pdf_translated_button.configure(state="normal")
+            self.post_session_pdf_fr_button.pack(fill="x", padx=14, pady=(0, 4))
+            self.post_session_pdf_translated_button.pack(fill="x", padx=14, pady=(0, 12))
 
     def _on_audio_level(self, rms: float):
         # normalisation approximative : une voix parlée normale tourne autour

@@ -36,7 +36,7 @@ class FasterWhisperBackend(TranscriptionBackend):
 
     def __init__(
         self,
-        model_size: str = "base",
+        model_size: str = "small",
         device: str = "cpu",
         compute_type: str = "int8",
         cpu_threads: int = 0,
@@ -62,10 +62,11 @@ class FasterWhisperBackend(TranscriptionBackend):
             audio,
             language="fr",
             vad_filter=True,  # filtre silence interne en plus de notre propre VAD
-            beam_size=1,  # decoding "greedy" : nettement plus rapide que beam_size=5,
-                           # léger compromis sur la précision
-            condition_on_previous_text=False,  # chaque segment traité indépendamment,
-                                                # évite un effet de dérive et coûte moins cher
+            beam_size=5,  # explore plusieurs hypothèses par mot : nettement plus précis
+                          # que le decoding "greedy" (beam_size=1), mais plus lent
+            condition_on_previous_text=True,  # garde le contexte du segment précédent,
+                                               # aide sur les phrases coupées entre deux segments
+            best_of=5,
         )
         return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -98,4 +99,4 @@ class WhisperCppBackend(TranscriptionBackend):
 
 def get_default_backend() -> TranscriptionBackend:
     """Backend utilisé par défaut pendant la phase de dev sous Windows."""
-    return FasterWhisperBackend(model_size="base", device="cpu", compute_type="int8")
+    return FasterWhisperBackend(model_size="small", device="cpu", compute_type="int8")
